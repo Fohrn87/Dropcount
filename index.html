@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="no">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>Droppeteller – Mobil (auto-ROI + sporing)</title>
+<style>
+  html, body { margin:0; padding:0; background:#0b0b0f; color:#fff; font-family:sans-serif; }
+  #app { padding:10px; max-width:900px; margin:auto; }
+  button, select, input { padding:6px; border-radius:8px; border:1px solid #333; background:#111; color:#fff; }
+  #video { display:none; }
+  #canvas { width:100%; background:#000; border-radius:8px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <h2>Droppeteller – Mobil (auto-ROI + sporing)</h2>
+  <div>
+    <button id="btnStart">Start kamera</button>
+    <select id="cameraSelect"></select>
+  </div>
+  <video id="video" playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div id="status"></div>
+</div>
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+let stream;
+let roi = null;
+let dropCount = 0;
+let flashTimer = 0;
+
+function setStatus(msg){ statusEl.textContent = msg; }
+
+async function listCameras(){
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const videoDevices = devices.filter(d => d.kind === 'videoinput');
+  const select = document.getElementById('cameraSelect');
+  select.innerHTML = '';
+  videoDevices.forEach((device, i) => {
+    const opt = document.createElement('option');
+    opt.value = device.deviceId;
+    opt.text = device.label || `Kamera ${i+1}`;
+    select.appendChild(opt);
+  });
+}
+
+async function startCamera(){
+  if(stream) stream.getTracks().forEach(t => t.stop());
+  const deviceId = document.getElementById('cameraSelect').value;
+  let constraints = { video: { deviceId: deviceId ? {exact: deviceId} : undefined } };
+  try {
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+  } catch(e){
+    setStatus('Første forsøk feilet, prøver fallback...');
+    constraints = { video: true };
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+  }
+  video.srcObject = stream;
+  await video.play();
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  requestAnimationFrame(processLoop);
+}
+
+function processLoop(){
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const frame = cv.imread(video);
+  const gray = new cv.Mat();
+  cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(gray, gray, new cv.Size(5,5), 0);
+
+  // Bevegelsesdeteksjon for ROI
+  if (!roi) {
+    const edges = new cv.Mat();
+    cv.Canny(gray, edges, 50, 150);
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    let maxRect = null; let maxArea = 0;
+    for(let i=0; i<contours.size(); i++){
+      const rect = cv.boundingRect(contours.get(i));
+      const area = rect.width * rect.height;
+      if(area > maxArea && rect.height > rect.width*1.5){
+        maxArea = area; maxRect = rect;
+      }
+    }
+    if(maxRect) roi = maxRect;
+    edges.delete(); contours.delete(); hierarchy.delete();
+  } else {
+    // Tegn ROI
+    ctx.strokeStyle = 'lime';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(roi.x, roi.y, roi.width, roi.height);
+
+    const roiMat = gray.roi(new cv.Rect(roi.x, roi.y, roi.width, roi.height));
+    const thresh = new cv.Mat();
+    cv.threshold(roiMat, thresh, 200, 255, cv.THRESH_BINARY);
+    const cnts = new cv.MatVector();
+    const hier = new cv.Mat();
+    cv.findContours(thresh, cnts, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    for(let i=0; i<cnts.size(); i++){
+      const r = cv.boundingRect(cnts.get(i));
+      if(r.height > roi.height*0.2 && r.width < roi.width*0.8){
+        dropCount++;
+        flashTimer = 5;
+      }
+    }
+    roiMat.delete(); thresh.delete(); cnts.delete(); hier.delete();
+  }
+
+  if(flashTimer > 0){
+    ctx.fillStyle = 'rgba(0,255,0,0.3)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    flashTimer--;
+  }
+
+  setStatus(`Dråper: ${dropCount}`);
+
+  frame.delete(); gray.delete();
+  requestAnimationFrame(processLoop);
+}
+
+document.getElementById('btnStart').addEventListener('click', startCamera);
+
+navigator.mediaDevices.getUserMedia({video:true})
+  .then(() => listCameras())
+  .catch(err => setStatus('Krever kameratilgang: ' + err));
+</script>
+</body>
+</html>
