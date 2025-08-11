@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="no">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>Droppeteller – mobil (auto-ROI)</title>
+  <style>
+    html, body { margin:0; padding:0; background:#0b0b0f; color:#fff; font-family:system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    #app { display:flex; flex-direction:column; gap:8px; padding:10px; max-width:900px; margin:0 auto; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .card { background:#11131a; border:1px solid #232634; border-radius:14px; padding:10px; }
+    label { font-size:14px; opacity:.9; }
+    input, button, select { background:#0f1219; color:#fff; border:1px solid #2a2f3d; border-radius:10px; padding:8px 12px; font-size:14px; }
+    button { cursor:pointer; }
+    #video, #canvas { width:100%; max-height:54vh; background:#000; border-radius:14px; }
+    .metrics { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:8px; }
+    .metric { background:#0f1219; border:1px solid #2a2f3d; border-radius:14px; padding:10px; text-align:center; }
+    .metric .v { font-size:24px; font-weight:700; }
+    .metric .k { font-size:12px; opacity:.8; }
+    .footer { font-size:12px; opacity:.7; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="row" style="justify-content:space-between;">
+      <div style="font-weight:700; font-size:18px;">Droppeteller – mobil (auto-ROI + sporing)</div>
+      <div style="font-size:12px; opacity:.75;">Beta • Ikke medisinsk utstyr</div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <button id="btnStart">Start kamera</button>
+        <button id="btnToggle" disabled>Pause</button>
+        <button id="btnReset" disabled>Nullstill</button>
+        <select id="facing">
+          <option value="environment" selected>Bak-kamera</option>
+          <option value="user">Front-kamera</option>
+        </select>
+        <label>Modus:
+          <select id="mode">
+            <option value="auto" selected>Auto-ROI + sporing</option>
+            <option value="manual">Manuell ROI</option>
+          </select>
+        </label>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <label>Dråpefaktor (gtt/mL): <input id="dropFactor" type="number" value="20" step="1" min="5" max="120" style="width:90px"/></label>
+        <label>Følsomhet:
+          <select id="sensitivity">
+            <option value="low">Lav</option>
+            <option value="medium" selected>Middels</option>
+            <option value="high">Høy</option>
+          </select>
+        </label>
+      </div>
+      <div class="footer" id="status">Gi kameratilgang. I auto-modus finner appen dråpekammeret selv og følger det ved små bevegelser.</div>
+    </div>
+
+    <div class="card">
+      <video id="video" playsinline muted></video>
+      <canvas id="canvas"></canvas>
+      <div class="metrics" style="margin-top:8px;">
+        <div class="metric"><div class="v" id="mDrops">0</div><div class="k">Dråper</div></div>
+        <div class="metric"><div class="v" id="mDpm">0.0</div><div class="k">DPM</div></div>
+        <div class="metric"><div class="v" id="mMlh">0.0</div><div class="k">mL/h</div></div>
+      </div>
+    </div>
+  </div>
+
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()"></script>
+  <script>
+    // --- UI helpers ---
+    const $ = id => document.getElementById(id);
+    const setStatus = (t, cls='') => { const s=$('status'); s.textContent=t; s.className='footer '+cls; };
+
+    // --- State ---
+    let video, canvas, ctx, stream;
+    let running=false, counting=false;
+    let roi=null; // {x,y,w,h}
+    let lastFrameROI=null; // cv.Mat for differanse i ROI
+    let drops=0, emaDpm=null, lastDropMs=0, intervals=[];
+    let minIntervalMs=250, emaAlpha=0.2;
+    let searchTemplate=null, searchRect=null, lastMatchScore=0;
+    let lastAutoDetectMs=0;
+
+    function updateSensitivity(){
+      const s=$('sensitivity').value;
+      minIntervalMs = (s==='low')?350:(s==='high')?180:250;
+    }
+    function computeMlh(){ const dpm=emaDpm||0; const df=parseFloat($('dropFactor').value||'20'); return (dpm/df)*60; }
+    function updateMetrics(){ $('mDrops').textContent=drops; $('mDpm').textContent=(emaDpm||0).toFixed(1); $('mMlh').textContent=computeMlh().toFixed(1); }
+
+    async function startCamera(){
+      if (stream) stream.getTracks().forEach(t=>t.stop());
+      const facingMode = $('facing').value;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode, width:{ideal:1280}, height:{ideal:720} }, audio:false });
+      } catch(e){ setStatus('Kunne ikke starte kamera: '+e.message,'warn'); return; }
+      video.srcObject = stream; await video.play();
+      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+      $('btnToggle').disabled=false; $('btnReset').disabled=false;
+      setStatus('Kamera i gang. I auto-modus søker appen etter dråpekammer.');
+    }
+
+    function grabGrayFrame(){
+      ctx.drawImage(video,0,0,canvas.width,canvas.height);
+      const rgba = cv.imread(canvas);
+      const gray = new cv.Mat();
+      cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
+      rgba.delete();
+      return gray; // caller must delete
+    }
+
+    // --- Auto-ROI: finn høy, smal bevegelsesregion (dråpekammer) ---
+    function autoDetectChamber(gray){
+      // bevegelsesvarmekart over hele bildet (diff fra forrige fullframe via en lett blur)
+      if (!autoDetectChamber.prev){ autoDetectChamber.prev = gray.clone(); return null; }
+      const diff = new cv.Mat();
+      cv.absdiff(gray, autoDetectChamber.prev, diff);
+      gray.copyTo(autoDetectChamber.prev);
+
+      cv.GaussianBlur(diff, diff, new cv.Size(7,7), 0);
+      const th = new cv.Mat();
+      cv.threshold(diff, th, 25, 255, cv.THRESH_BINARY);
+      const kernel = cv.Mat.ones(3,3, cv.CV_8U);
+      cv.morphologyEx(th, th, cv.MORPH_OPEN, kernel);
+      cv.morphologyEx(th, th, cv.MORPH_CLOSE, kernel);
+
+      const contours = new cv.MatVector();
+      const hierarchy = new cv.Mat();
+      cv.findContours(th, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+      let best=null, bestScore=0;
+      for (let i=0;i<contours.size();i++){
+        const r = cv.boundingRect(contours.get(i));
+        const area = r.width*r.height;
+        const aspect = r.height / Math.max(1,r.width);
+        // Heuristikk: høy, smal, ikke for liten, ikke hele bildet
+        if (area < (gray.rows*gray.cols)*0.002 || area > (gray.rows*gray.cols)*0.25) continue;
+        if (aspect < 1.8) continue;
+        // score: kombiner aspekt + areal + vertikal sentrering
+        const centerY = r.y + r.height/2; const cyScore = 1.0 - Math.abs(centerY - gray.rows*0.55)/(gray.rows*0.55);
+        const score = 0.6*aspect + 0.3*Math.sqrt(area) + 0.1*cyScore;
+        if (score > bestScore){ bestScore=score; best=r; }
+      }
+
+      contours.delete(); hierarchy.delete(); th.delete(); diff.delete(); kernel.delete();
+
+      if (!best) return null;
+      // utvid litt for sikkerhetsmargin
+      const padX = Math.round(best.width*0.25), padY = Math.round(best.height*0.1);
+      const x = Math.max(0, best.x - padX);
+      const y = Math.max(0, best.y - padY);
+      const w = Math.min(gray.cols - x, best.width + padX*2);
+      const h = Math.min(gray.rows - y, best.height + padY*2);
+      return {x,y,w,h};
+    }
+
+    // --- Template matching sporing rundt forrige ROI ---
+    function updateTracker(gray){
+      if (!roi) return;
+      const r = new cv.Rect(roi.x, roi.y, Math.max(1,roi.w), Math.max(1,roi.h));
+      if (!searchTemplate){
+        // lag mal fra midtre stripe av ROI for å fokusere på kammerets struktur
+        const inner = new cv.Rect(r.x + Math.floor(r.width*0.3), r.y, Math.max(5, Math.floor(r.width*0.4)), r.height);
+        const roiStrip = gray.roi(inner);
+        searchTemplate = roiStrip.clone();
+        roiStrip.delete();
+        // definer søkeområde litt større enn ROI
+        searchRect = new cv.Rect(Math.max(0, r.x - Math.floor(r.width*0.35)), Math.max(0, r.y - Math.floor(r.height*0.2)), Math.min(gray.cols - r.x + Math.floor(r.width*0.35), Math.floor(r.width*1.7)), Math.min(gray.rows - r.y + Math.floor(r.height*0.2), Math.floor(r.height*1.4)));
+        return;
+      }
+      const search = gray.roi(searchRect);
+      const result = new cv.Mat();
+      const resW = search.cols - searchTemplate.cols + 1;
+      const resH = search.rows - searchTemplate.rows + 1;
+      result.create(resH, resW, cv.CV_32FC1);
+      cv.matchTemplate(search, searchTemplate, result, cv.TM_CCOEFF_NORMED);
+      const minMax = cv.minMaxLoc(result);
+      lastMatchScore = minMax.maxVal;
+      const topLeft = minMax.maxLoc;
+      // oppdater ROI basert på malens plassering (oversettelse)
+      const newX = searchRect.x + topLeft.x - Math.floor(roi.w*0.3);
+      const newY = searchRect.y + topLeft.y;
+      roi = { x: Math.max(0, Math.min(gray.cols - roi.w, newX)), y: Math.max(0, Math.min(gray.rows - roi.h, newY)), w: roi.w, h: roi.h };
+
+      search.delete(); result.delete();
+
+      // re-init mal periodisk eller hvis score lav
+      const now = performance.now();
+      if (lastMatchScore < 0.45 || (now - lastAutoDetectMs) > 2500){
+        searchTemplate.delete(); searchTemplate = null; lastAutoDetectMs = now;
+      }
+    }
+
+    function processLoop(){
+      if (!running) return;
+      const gray = grabGrayFrame();
+      let display = cv.imread(canvas); // RGBA
+
+      // modus
+      const mode = $('mode').value;
+      const now = performance.now();
+
+      if (mode === 'auto'){
+        // 1) spor ROI hvis vi har en
+        if (roi) updateTracker(gray);
+        // 2) auto-detect hvis ingen ROI eller vi nettopp resatte/score lav
+        if (!roi || lastMatchScore < 0.45){
+          const det = autoDetectChamber(gray);
+          if (det) { roi = det; searchTemplate && (searchTemplate.delete(), searchTemplate=null); lastAutoDetectMs = now; setStatus('Fant dråpekammer automatisk.'); }
+        }
+      } else {
+        // manuell standard-ROI hvis ikke satt
+        if (!roi){
+          const w = canvas.width, h = canvas.height;
+          const rw = Math.round(w*0.22), rh = Math.round(h*0.78);
+          const rx = Math.round((w-rw)/2), ry = Math.round((h-rh)/2);
+          roi = {x:rx, y:ry, w:rw, h:rh};
+          setStatus('Manuell modus: flytt kamera slik at ROI treffer kammeret.');
+        }
+      }
+
+      // droppetelling innenfor ROI (lik som før: frame differencing i ROI)
+      if (roi){
+        const r = new cv.Rect(roi.x, roi.y, Math.max(1,roi.w), Math.max(1,roi.h));
+        const roiGray = gray.roi(r);
+
+        if (!lastFrameROI || lastFrameROI.cols!==roiGray.cols || lastFrameROI.rows!==roiGray.rows){
+          if (lastFrameROI) lastFrameROI.delete();
+          lastFrameROI = roiGray.clone();
+        }
+        const diff = new cv.Mat();
+        cv.absdiff(roiGray, lastFrameROI, diff);
+        roiGray.copyTo(lastFrameROI);
+        const th = new cv.Mat();
+        cv.GaussianBlur(diff, diff, new cv.Size(5,5), 0);
+        cv.threshold(diff, th, 25, 255, cv.THRESH_BINARY);
+        const kernel = cv.Mat.ones(3,3, cv.CV_8U);
+        cv.morphologyEx(th, th, cv.MORPH_OPEN, kernel);
+        cv.morphologyEx(th, th, cv.MORPH_CLOSE, kernel);
+        const contours = new cv.MatVector();
+        const hierarchy = new cv.Mat();
+        cv.findContours(th, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+        const lineY = roi.y + Math.round(roi.h*0.6);
+        const nowMs = performance.now();
+        for (let i=0;i<contours.size();i++){
+          const rect = cv.boundingRect(contours.get(i));
+          const area = rect.width*rect.height;
+          if (area < 20 || rect.height < 6 || rect.height > roi.h*0.6) continue;
+          const cx = rect.x + rect.width/2 + roi.x;
+          const cy = rect.y + rect.height/2 + roi.y;
+          if (Math.abs(cy - lineY) <= 5){
+            if (nowMs - lastDropMs >= minIntervalMs){
+              if (window._prevEventMs === undefined) window._prevEventMs = nowMs; else {
+                const dt = nowMs - window._prevEventMs; window._prevEventMs = nowMs;
+                if (dt >= 150 && dt <= 8000){
+                  intervals.push(dt); if (intervals.length>10) intervals.shift();
+                  const instDpm = 60000.0/dt;
+                  emaDpm = (emaDpm==null)?instDpm:(emaAlpha*instDpm + (1-emaAlpha)*emaDpm);
+                }
+              }
+              drops += 1; lastDropMs = nowMs; updateMetrics();
+            }
+          }
+        }
+
+        // tegn overlay
+        const g = canvas.getContext('2d');
+        g.save();
+        g.strokeStyle = 'rgba(255,255,0,.9)'; g.lineWidth = 3; g.strokeRect(roi.x, roi.y, roi.w, roi.h);
+        g.strokeStyle = 'rgba(0,255,255,.9)'; g.beginPath(); g.moveTo(roi.x, lineY); g.lineTo(roi.x+roi.w, lineY); g.stroke();
+        g.restore();
+
+        contours.delete(); hierarchy.delete(); th.delete(); diff.delete(); kernel.delete(); roiGray.delete();
+      }
+
+      cv.imshow(canvas, display); display.delete(); gray.delete();
+
+      if (counting) requestAnimationFrame(processLoop); else running=false;
+    }
+
+    function toggleCounting(){ if (!stream) return; counting=!counting; $('btnToggle').textContent = counting?'Pause':'Start'; if (counting){ running=true; requestAnimationFrame(processLoop);} }
+    function resetAll(){ drops=0; emaDpm=null; intervals.length=0; lastDropMs=0; window._prevEventMs=undefined; updateMetrics(); searchTemplate&&searchTemplate.delete(); searchTemplate=null; roi=null; setStatus('Nullstilt.'); }
+
+    function onOpenCvReady(){ window.onOpenCvReady = () => setStatus('OpenCV.js lastet. Start kamera.'); }
+
+    // init UI
+    window.addEventListener('DOMContentLoaded', () => {
+      video=$('video'); canvas=$('canvas'); ctx=canvas.getContext('2d');
+      $('btnStart').onclick = async()=>{ await startCamera(); counting=true; running=true; updateSensitivity(); requestAnimationFrame(processLoop); };
+      $('btnToggle').onclick = toggleCounting; $('btnReset').onclick = resetAll;
+      $('dropFactor').onchange = updateMetrics; $('sensitivity').onchange = updateSensitivity; $('facing').onchange = startCamera;
+      $('mode').onchange = ()=>{ roi=null; searchTemplate&&searchTemplate.delete(); searchTemplate=null; setStatus($('mode').value==='auto'?'Auto-modus aktiv.':'Manuell modus: plasser kammeret innenfor rammen.'); };
+    });
+  </script>
+</body>
+</html>
